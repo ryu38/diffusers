@@ -305,6 +305,11 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--random_flip",
+        action="store_true",
+        help="whether to randomly flip images horizontally",
+    )
+    parser.add_argument(
         "--train_text_encoder",
         action="store_true",
         help="Whether to train the text encoder. If set, the text encoder should be float32 precision.",
@@ -626,6 +631,7 @@ class DreamBoothDataset(Dataset):
             [
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
