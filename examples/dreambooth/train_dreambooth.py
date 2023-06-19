@@ -578,6 +578,24 @@ def parse_args(input_args=None):
     return args
 
 
+class RandomPadding:
+
+  def __init__(self, size, pad_scale=(0.0, 0.1), fill=0, padding_mode="constant"):
+    self.size = size
+    self.pad_scale = pad_scale
+    self.fill = fill
+    self.padding_mode = padding_mode
+
+  def __call__(self, image):
+    scale = random.uniform(self.pad_scale[0], self.pad_scale[1])
+    pad_size = int(self.size * scale)
+    pad_left = random.randint(0, pad_size)
+    pad_top = random.randint(0, pad_size)
+    padding = (pad_left, pad_top, pad_size - pad_left, pad_size - pad_top)
+
+    return transforms.functional.pad(img, padding, self.fill, self.padding_mode)
+
+
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
@@ -629,6 +647,8 @@ class DreamBoothDataset(Dataset):
 
         self.image_transforms = transforms.Compose(
             [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                RandomPadding(size, pad_scale=(0.0, 0.1), fill=(255, 255, 255), padding_mode='constant'),
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
                 transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
