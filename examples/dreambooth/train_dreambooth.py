@@ -594,7 +594,7 @@ class RandomPadding:
     pad_top = random.randint(0, pad_size)
     padding = (pad_left, pad_top, pad_size - pad_left, pad_size - pad_top)
 
-    return transforms.functional.pad(img, padding, self.fill, self.padding_mode)
+    return transforms.functional.pad(image, padding, self.fill, self.padding_mode)
 
 
 class DreamBoothDataset(Dataset):
