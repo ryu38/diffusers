@@ -551,6 +551,12 @@ def parse_args(input_args=None):
         default=None,
         help="The optional `class_label` conditioning to pass to the unet, available values are `timesteps`.",
     )
+    parser.add_argument(
+        "--data_augmentation_pad_max",
+        type=float,
+        default=0.1,
+        help="Max padding value for data augmentation (optional)",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -646,10 +652,12 @@ class DreamBoothDataset(Dataset):
         else:
             self.class_data_root = None
 
+        logger.info(f"data_augmentation_pad_max: {args.data_augmentation_pad_max}.")
+
         self.image_transforms = transforms.Compose(
             [
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                RandomPadding(size, pad_scale=(0.0, 0.1), fill=(255, 255, 255), padding_mode='constant'),
+                RandomPadding(size, pad_scale=(0.0, args.data_augmentation_pad_max), fill=(255, 255, 255), padding_mode='constant'),
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
                 transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
