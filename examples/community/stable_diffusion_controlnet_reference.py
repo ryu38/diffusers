@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import PIL.Image
 import torch
+from copy import deepcopy
 
 from diffusers import StableDiffusionControlNetPipeline
 from diffusers.models import ControlNetModel
@@ -128,8 +129,13 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
         attention_auto_machine_weight: float = 1.0,
         gn_auto_machine_weight: float = 1.0,
         style_fidelity: float = 0.5,
+        control_guidance_start: Union[float, List[float]] = 0.0,
+        control_guidance_end: Union[float, List[float]] = 1.0,
         reference_attn: bool = True,
         reference_adain: bool = True,
+        reference_attn2: bool = False,
+        reference_adain2: bool = False,
+        reference_mode_switch_step: Optional[float] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -233,6 +239,17 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
         """
         assert reference_attn or reference_adain, "`reference_attn` or `reference_adain` must be True."
 
+        # align format for control guidance
+        if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
+            control_guidance_start = len(control_guidance_end) * [control_guidance_start]
+        elif not isinstance(control_guidance_end, list) and isinstance(control_guidance_start, list):
+            control_guidance_end = len(control_guidance_start) * [control_guidance_end]
+        elif not isinstance(control_guidance_start, list) and not isinstance(control_guidance_end, list):
+            mult = len(controlnet.nets) if isinstance(controlnet, MultiControlNetModel) else 1
+            control_guidance_start, control_guidance_end = mult * [control_guidance_start], mult * [
+                control_guidance_end
+            ]
+
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt,
@@ -242,6 +259,8 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
             prompt_embeds,
             negative_prompt_embeds,
             controlnet_conditioning_scale,
+            control_guidance_start,
+            control_guidance_end,
         )
 
         # 2. Define call parameters
@@ -677,7 +696,11 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
                     hidden_states = upsampler(hidden_states, upsample_size)
 
             return hidden_states
+        
+        if reference_mode_switch_step is not None:
+            self.unet2 = deepcopy(self.unet)
 
+        # first unet
         if reference_attn:
             attn_modules = [module for module in torch_dfs(self.unet) if isinstance(module, BasicTransformerBlock)]
             attn_modules = sorted(attn_modules, key=lambda x: -x.norm1.normalized_shape[0])
@@ -720,10 +743,68 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
                 module.var_bank = []
                 module.gn_weight *= 2
 
+        # second unet
+        if reference_mode_switch_step is not None and reference_attn2:
+            attn_modules = [module for module in torch_dfs(self.unet2) if isinstance(module, BasicTransformerBlock)]
+            attn_modules = sorted(attn_modules, key=lambda x: -x.norm1.normalized_shape[0])
+
+            for i, module in enumerate(attn_modules):
+                module._original_inner_forward = module.forward
+                module.forward = hacked_basic_transformer_inner_forward.__get__(module, BasicTransformerBlock)
+                module.bank = []
+                module.attn_weight = float(i) / float(len(attn_modules))
+
+        if reference_mode_switch_step is not None and reference_adain2:
+            gn_modules = [self.unet2.mid_block]
+            self.unet2.mid_block.gn_weight = 0
+
+            down_blocks = self.unet2.down_blocks
+            for w, module in enumerate(down_blocks):
+                module.gn_weight = 1.0 - float(w) / float(len(down_blocks))
+                gn_modules.append(module)
+
+            up_blocks = self.unet2.up_blocks
+            for w, module in enumerate(up_blocks):
+                module.gn_weight = float(w) / float(len(up_blocks))
+                gn_modules.append(module)
+
+            for i, module in enumerate(gn_modules):
+                if getattr(module, "original_forward", None) is None:
+                    module.original_forward = module.forward
+                if i == 0:
+                    # mid_block
+                    module.forward = hacked_mid_forward.__get__(module, torch.nn.Module)
+                elif isinstance(module, CrossAttnDownBlock2D):
+                    module.forward = hack_CrossAttnDownBlock2D_forward.__get__(module, CrossAttnDownBlock2D)
+                elif isinstance(module, DownBlock2D):
+                    module.forward = hacked_DownBlock2D_forward.__get__(module, DownBlock2D)
+                elif isinstance(module, CrossAttnUpBlock2D):
+                    module.forward = hacked_CrossAttnUpBlock2D_forward.__get__(module, CrossAttnUpBlock2D)
+                elif isinstance(module, UpBlock2D):
+                    module.forward = hacked_UpBlock2D_forward.__get__(module, UpBlock2D)
+                module.mean_bank = []
+                module.var_bank = []
+                module.gn_weight *= 2
+
+        unet_switched = False
+
+        # Create tensor stating which controlnets to keep
+        controlnet_keep = []
+        for i in range(num_inference_steps):
+            keeps = [
+                1.0 - float(i / num_inference_steps < s or (i + 1) / num_inference_steps > e)
+                for s, e in zip(control_guidance_start, control_guidance_end)
+            ]
+            controlnet_keep.append(keeps[0] if len(keeps) == 1 else keeps)
+
         # 11. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                if reference_mode_switch_step is not None and not unet_switched and (i / num_inference_steps) > reference_mode_switch_step:
+                    self.unet = self.unet2
+                    unet_switched = True
+
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -737,6 +818,11 @@ class StableDiffusionControlNetReferencePipeline(StableDiffusionControlNetPipeli
                 else:
                     control_model_input = latent_model_input
                     controlnet_prompt_embeds = prompt_embeds
+
+                if isinstance(controlnet_keep[i], list):
+                    cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                else:
+                    cond_scale = controlnet_conditioning_scale * controlnet_keep[i]
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     control_model_input,
